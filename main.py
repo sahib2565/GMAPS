@@ -1,3 +1,5 @@
+import os
+import json
 import osmnx as ox
 import folium
 
@@ -56,9 +58,51 @@ def main():
         tooltip=folium.GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None
     ).add_to(m)
     
-    print("Saving interactive map to 'map.html'...")
-    m.save("map.html")
-    print("Done! You can open 'map.html' in your browser.")
+    # Ensure public folder exists
+    public_dir = os.path.join("app", "public")
+    os.makedirs(public_dir, exist_ok=True)
+    
+    print("Saving interactive map to 'app/public/map.html'...")
+    m.save(os.path.join(public_dir, "map.html"))
+    
+    # Extract metadata and stats
+    print("Extracting and saving node metadata to 'app/public/graph_data.json'...")
+    num_nodes = len(G.nodes)
+    num_edges = len(G.edges)
+    
+    # Calculate average street count
+    street_counts_series = gdf_nodes['street_count']
+    avg_street_count = float(street_counts_series.mean())
+    street_counts_dist = {int(k): int(v) for k, v in street_counts_series.value_counts().items()}
+    
+    # List of node objects
+    nodes_list = []
+    for node_id, data in G.nodes(data=True):
+        nodes_list.append({
+            "id": int(node_id),
+            "lat": float(data.get('y')),
+            "lon": float(data.get('x')),
+            "street_count": int(data.get('street_count', 0))
+        })
+        
+    # Sort nodes by street_count descending
+    nodes_list.sort(key=lambda x: x['street_count'], reverse=True)
+    
+    graph_data = {
+        "location": "Verona, Italy",
+        "network_type": "drive",
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
+        "avg_street_count": round(avg_street_count, 2),
+        "street_counts": street_counts_dist,
+        "center": {"lat": center_lat, "lon": center_lon},
+        "nodes": nodes_list
+    }
+    
+    with open(os.path.join(public_dir, "graph_data.json"), "w", encoding="utf-8") as f:
+        json.dump(graph_data, f, indent=2)
+        
+    print("Done! Files successfully created in Next.js public directory.")
 
 
 if __name__ == "__main__":
