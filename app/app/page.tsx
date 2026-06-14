@@ -1,6 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 interface Node {
   id: number;
@@ -9,225 +13,246 @@ interface Node {
   street_count: number;
 }
 
-interface Edge {
-  target: string;
-  weight: number;
-  coords: [number, number][];
-}
-
-type AdjacencyList = Record<string, Edge[]>;
-
-interface GraphData {
+interface GraphInfo {
   location: string;
+  loading_location?: string | null;
   network_type: string;
   num_nodes: number;
   num_edges: number;
-  avg_street_count: number;
-  street_counts: Record<string, number>;
   center: { lat: number; lon: number };
-  nodes: Node[];
-  adjacency: AdjacencyList;
 }
 
-// A simple MinHeap implementation for Dijkstra's Priority Queue
-class MinHeap {
-  elements: { id: string; priority: number }[] = [];
-  
-  push(element: { id: string; priority: number }) {
-    this.elements.push(element);
-    this.up(this.elements.length - 1);
-  }
-  
-  pop() {
-    if (this.elements.length === 0) return null;
-    const top = this.elements[0];
-    const bottom = this.elements.pop();
-    if (this.elements.length > 0 && bottom) {
-      this.elements[0] = bottom;
-      this.down(0);
-    }
-    return top;
-  }
-  
-  up(index: number) {
-    while (index > 0) {
-      const parent = Math.floor((index - 1) / 2);
-      if (this.elements[index].priority >= this.elements[parent].priority) break;
-      this.swap(index, parent);
-      index = parent;
-    }
-  }
-  
-  down(index: number) {
-    const len = this.elements.length;
-    while (index * 2 + 1 < len) {
-      let child = index * 2 + 1;
-      if (child + 1 < len && this.elements[child + 1].priority < this.elements[child].priority) {
-        child++;
-      }
-      if (this.elements[index].priority <= this.elements[child].priority) break;
-      this.swap(index, child);
-      index = child;
-    }
-  }
-  
-  swap(i: number, j: number) {
-    const tmp = this.elements[i];
-    this.elements[i] = this.elements[j];
-    this.elements[j] = tmp;
-  }
-  
-  isEmpty() {
-    return this.elements.length === 0;
-  }
+interface RouteResult {
+  found: boolean;
+  path: number[];
+  coords: [number, number][];
+  distance: number;
+  junctions: number;
 }
 
-// Client-side Dijkstra Shortest Path Router
-function calculateShortestPath(
-  adj: AdjacencyList,
-  start: string,
-  end: string
-): { path: string[]; coords: [number, number][]; distance: number } | null {
-  if (!adj) {
-    console.error("Adjacency list is undefined!");
-    return null;
-  }
-  const distances: Record<string, number> = {};
-  const previous: Record<string, string | null> = {};
-  const edgeCoords: Record<string, [number, number][]> = {};
-  const heap = new MinHeap();
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
 
-  distances[start] = 0;
-  previous[start] = null;
-  heap.push({ id: start, priority: 0 });
-
-  while (!heap.isEmpty()) {
-    const item = heap.pop();
-    if (!item) break;
-    const u = item.id;
-    const dist = item.priority;
-
-    if (dist > distances[u]) continue;
-
-    if (u === end) {
-      const path: string[] = [];
-      const coords: [number, number][] = [];
-      let curr: string | null | undefined = end;
-      const totalDistance = distances[end];
-
-      while (curr) {
-        path.push(curr);
-        const prev = previous[curr];
-        if (prev) {
-          const edgeGeo = edgeCoords[`${prev}->${curr}`];
-          if (edgeGeo) {
-            // Prepend the segment coordinates to trace path from start to end
-            coords.unshift(...edgeGeo);
-          }
-        }
-        curr = prev;
-      }
-      return { path: path.reverse(), coords, distance: totalDistance };
-    }
-
-    const neighbors = adj[u] || [];
-    for (const edge of neighbors) {
-      const v = edge.target;
-      const newDist = dist + edge.weight;
-      if (distances[v] === undefined || newDist < distances[v]) {
-        distances[v] = newDist;
-        previous[v] = u;
-        edgeCoords[`${u}->${v}`] = edge.coords;
-        heap.push({ id: v, priority: newDist });
-      }
-    }
-  }
-  return null;
+async function fetchGraphInfo(): Promise<GraphInfo> {
+  const res = await fetch("/api/graph-info");
+  if (!res.ok) throw new Error("Failed to load graph info");
+  return res.json();
 }
+
+async function fetchNodes(
+  search: string,
+  minStreets: number | "",
+  limit = 50
+): Promise<{ total: number; nodes: Node[] }> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (search) params.set("search", search);
+  if (minStreets !== "") params.set("min_streets", String(minStreets));
+  const res = await fetch(`/api/nodes?${params}`);
+  if (!res.ok) throw new Error("Failed to fetch nodes");
+  return res.json();
+}
+
+async function fetchNearestNode(lat: number, lng: number): Promise<Node> {
+  const res = await fetch("/api/nearest-node", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lat, lng }),
+  });
+  if (!res.ok) throw new Error("Failed to find nearest node");
+  return res.json();
+}
+
+async function fetchRoute(
+  sourceId: number,
+  destId: number
+): Promise<RouteResult> {
+  const res = await fetch("/api/route", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_id: sourceId, destination_id: destId }),
+  });
+  if (!res.ok) throw new Error("Failed to calculate route");
+  return res.json();
+}
+
+async function loadNewLocation(
+  location: string,
+  networkType = "drive"
+): Promise<GraphInfo> {
+  const res = await fetch("/api/load-location", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ location, network_type: networkType }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || "Failed to load location");
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 
 export default function Home() {
-  const [data, setData] = useState<GraphData | null>(null);
+  // Graph metadata
+  const [info, setInfo] = useState<GraphInfo | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Location search
+  const [locationInput, setLocationInput] = useState("");
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [locationError, setLocationError] = useState("");
+
+  // Node explorer
   const [search, setSearch] = useState("");
   const [minStreets, setMinStreets] = useState<number | "">("");
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [totalNodes, setTotalNodes] = useState(0);
+  const [nodesLoading, setNodesLoading] = useState(false);
 
-  // Routing State
+  // Routing
   const [sourceNode, setSourceNode] = useState<Node | null>(null);
   const [destNode, setDestNode] = useState<Node | null>(null);
-  const [routingMode, setRoutingMode] = useState<"source" | "destination" | null>("source");
-  const [calculatedRoute, setCalculatedRoute] = useState<{
-    path: string[];
-    coords: [number, number][];
-    distance: number;
-  } | null>(null);
+  const [routingMode, setRoutingMode] = useState<
+    "source" | "destination" | null
+  >("source");
+  const [calculatedRoute, setCalculatedRoute] = useState<RouteResult | null>(
+    null
+  );
+  const [routeLoading, setRouteLoading] = useState(false);
 
-  // Fetch the graph data on load
+  // Map iframe key (force remount on location change)
+  const [mapKey, setMapKey] = useState(0);
+
+  // Debounce timer for node search
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ------------------------------------------------------------------
+  // Initial load
+  // ------------------------------------------------------------------
   useEffect(() => {
-    fetch("/graph_data.json?t=" + Date.now())
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error("Failed to load map data");
-        }
-        return res.json();
-      })
-      .then((data: GraphData) => {
-        setData(data);
+    fetchGraphInfo()
+      .then((data) => {
+        setInfo(data);
         setLoading(false);
       })
       .catch((err) => {
-        console.error("Error loading graph data:", err);
+        console.error(err);
         setLoading(false);
       });
   }, []);
 
-  // Listen to MAP_CLICK messages from the iframe
+  // ------------------------------------------------------------------
+  // Load nodes (debounced)
+  // ------------------------------------------------------------------
+  const loadNodes = useCallback(() => {
+    setNodesLoading(true);
+    fetchNodes(search, minStreets)
+      .then((res) => {
+        setNodes(res.nodes);
+        setTotalNodes(res.total);
+      })
+      .catch(console.error)
+      .finally(() => setNodesLoading(false));
+  }, [search, minStreets]);
+
   useEffect(() => {
-    const handleMapClick = (event: MessageEvent) => {
+    if (!info) return;
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(loadNodes, 300);
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    };
+  }, [info, loadNodes]);
+
+  // ------------------------------------------------------------------
+  // Map click → nearest node
+  // ------------------------------------------------------------------
+  const onMapClicked = useCallback(
+    async (lat: number, lng: number) => {
+      if (!info) return;
+      try {
+        const closest = await fetchNearestNode(lat, lng);
+        if (routingMode === "source") {
+          setSourceNode(closest);
+          setRoutingMode("destination");
+        } else if (routingMode === "destination") {
+          setDestNode(closest);
+          setRoutingMode(null);
+        } else {
+          if (!sourceNode) {
+            setSourceNode(closest);
+            setRoutingMode("destination");
+          } else if (!destNode) {
+            setDestNode(closest);
+            setRoutingMode(null);
+          } else {
+            setSourceNode(closest);
+            setDestNode(null);
+            setCalculatedRoute(null);
+            setRoutingMode("destination");
+          }
+        }
+      } catch (err) {
+        console.error("Nearest node lookup failed:", err);
+      }
+    },
+    [info, routingMode, sourceNode, destNode]
+  );
+
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
       const msg = event.data;
       if (msg && msg.type === "MAP_CLICK") {
-        console.log("NextJS received MAP_CLICK:", msg);
         onMapClicked(msg.lat, msg.lng);
       }
     };
-    window.addEventListener("message", handleMapClick);
-    return () => window.removeEventListener("message", handleMapClick);
-  }, [data, routingMode, sourceNode, destNode]);
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [onMapClicked]);
 
-  // Sync route drawing with iframe whenever source or destination changes
+  // ------------------------------------------------------------------
+  // Route calculation (server-side) + iframe sync
+  // ------------------------------------------------------------------
   useEffect(() => {
-    const iframe = document.getElementById("map-iframe") as HTMLIFrameElement | null;
-    if (!iframe || !iframe.contentWindow) return;
+    const iframe = document.getElementById(
+      "map-iframe"
+    ) as HTMLIFrameElement | null;
+    if (!iframe?.contentWindow) return;
 
-    if (sourceNode && destNode && data) {
-      const route = calculateShortestPath(
-        data.adjacency,
-        sourceNode.id.toString(),
-        destNode.id.toString()
-      );
-      if (route) {
-        iframe.contentWindow.postMessage(
-          {
-            type: "UPDATE_ROUTE",
-            source: { lat: sourceNode.lat, lng: sourceNode.lon, id: sourceNode.id },
-            destination: { lat: destNode.lat, lng: destNode.lon, id: destNode.id },
-            routeCoords: route.coords,
-          },
-          "*"
-        );
-        setCalculatedRoute(route);
-      } else {
-        iframe.contentWindow.postMessage(
-          {
-            type: "UPDATE_ROUTE",
-            source: { lat: sourceNode.lat, lng: sourceNode.lon, id: sourceNode.id },
-            destination: { lat: destNode.lat, lng: destNode.lon, id: destNode.id },
-            routeCoords: [],
-          },
-          "*"
-        );
-        setCalculatedRoute(null);
-      }
+    if (sourceNode && destNode) {
+      setRouteLoading(true);
+      fetchRoute(sourceNode.id, destNode.id)
+        .then((route) => {
+          setCalculatedRoute(route.found ? route : null);
+          iframe.contentWindow!.postMessage(
+            {
+              type: "UPDATE_ROUTE",
+              source: {
+                lat: sourceNode.lat,
+                lng: sourceNode.lon,
+                id: sourceNode.id,
+              },
+              destination: {
+                lat: destNode.lat,
+                lng: destNode.lon,
+                id: destNode.id,
+              },
+              routeCoords: route.found ? route.coords : [],
+            },
+            "*"
+          );
+        })
+        .catch((err) => {
+          console.error("Route calculation failed:", err);
+          setCalculatedRoute(null);
+        })
+        .finally(() => setRouteLoading(false));
     } else {
+      // Show markers only (no route yet)
       iframe.contentWindow.postMessage(
         {
           type: "UPDATE_ROUTE",
@@ -243,143 +268,217 @@ export default function Home() {
       );
       setCalculatedRoute(null);
     }
-  }, [sourceNode, destNode, data]);
+  }, [sourceNode, destNode]);
 
+  // ------------------------------------------------------------------
+  // Locate node on map
+  // ------------------------------------------------------------------
   const handleLocateNode = (node: Node) => {
-    console.log("Locate button clicked for node:", node);
-    const iframe = document.getElementById("map-iframe") as HTMLIFrameElement | null;
-    if (iframe && iframe.contentWindow) {
-      console.log("Sending LOCATE_NODE message to iframe", { lat: node.lat, lng: node.lon });
+    const iframe = document.getElementById(
+      "map-iframe"
+    ) as HTMLIFrameElement | null;
+    if (iframe?.contentWindow) {
       iframe.contentWindow.postMessage(
-        {
-          type: "LOCATE_NODE",
-          lat: node.lat,
-          lng: node.lon,
-        },
+        { type: "LOCATE_NODE", lat: node.lat, lng: node.lon },
         "*"
       );
-    } else {
-      console.error("Iframe not found or not accessible!");
     }
   };
 
-  // Handle map click by finding closest node
-  const onMapClicked = (lat: number, lng: number) => {
-    console.log("onMapClicked triggered with:", lat, lng);
-    if (!data) {
-        console.warn("No data available for click!");
-        return;
-    }
-
-    let closestNode = data.nodes[0];
-    let minDist = Infinity;
-    for (const node of data.nodes) {
-      const dist = Math.pow(node.lat - lat, 2) + Math.pow(node.lon - lng, 2);
-      if (dist < minDist) {
-        minDist = dist;
-        closestNode = node;
-      }
-    }
-    
-    console.log("Closest node found:", closestNode);
-
-    if (routingMode === "source") {
-      setSourceNode(closestNode);
-      setRoutingMode("destination");
-    } else if (routingMode === "destination") {
-      setDestNode(closestNode);
-      setRoutingMode(null);
-    } else {
-      // Default to alternating
-      if (!sourceNode) {
-        setSourceNode(closestNode);
-        setRoutingMode("destination");
-      } else if (!destNode) {
-        setDestNode(closestNode);
-        setRoutingMode(null);
-      } else {
-        setSourceNode(closestNode);
-        setDestNode(null);
-        setRoutingMode("destination");
-      }
-    }
-  };
-
+  // ------------------------------------------------------------------
+  // Reset route
+  // ------------------------------------------------------------------
   const handleReset = () => {
     setSourceNode(null);
     setDestNode(null);
     setCalculatedRoute(null);
     setRoutingMode("source");
+    const iframe = document.getElementById(
+      "map-iframe"
+    ) as HTMLIFrameElement | null;
+    if (iframe?.contentWindow) {
+      iframe.contentWindow.postMessage({ type: "CLEAR_ROUTE" }, "*");
+    }
+  };
+  // ------------------------------------------------------------------
+  // Poll for background loading
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (!info?.loading_location) return;
+
+    const interval = setInterval(() => {
+      fetchGraphInfo()
+        .then((data) => {
+          setInfo(data);
+          if (!data.loading_location) {
+            // Finished loading!
+            setMapKey((k) => k + 1);
+            setLocationLoading(false);
+            loadNodes();
+          }
+        })
+        .catch(console.error);
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [info?.loading_location, loadNodes]);
+
+  // ------------------------------------------------------------------
+  // Switch location
+  // ------------------------------------------------------------------
+  const handleLoadLocation = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const loc = locationInput.trim();
+    if (!loc) return;
+    setLocationLoading(true);
+    setLocationError("");
+    handleReset();
+    try {
+      const res = await loadNewLocation(loc);
+      // The backend returns { status: "loading", location: "..." }
+      setInfo((prev) => (prev ? { ...prev, loading_location: res.location } : null));
+      setLocationInput("");
+      // We don't clear setLocationLoading(false) here. 
+      // The polling effect will clear it once graph-info reports it's done.
+    } catch (err: unknown) {
+      setLocationError(
+        err instanceof Error ? err.message : "Failed to load location"
+      );
+      setLocationLoading(false);
+    }
   };
 
-  if (loading) {
+  // ------------------------------------------------------------------
+  // Render: Loading state
+  // ------------------------------------------------------------------
+  if (loading || info?.loading_location) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-zinc-950 text-white font-sans">
         <div className="flex flex-col items-center gap-4">
-          <div className="h-8 w-8 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent"></div>
-          <p className="text-zinc-400 animate-pulse">Loading GIS Data...</p>
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent" />
+          <p className="text-zinc-400 animate-pulse">
+            {info?.loading_location 
+              ? `Downloading map data for ${info.loading_location}... (This may take a minute)` 
+              : `Connecting to backend...`}
+          </p>
         </div>
       </div>
     );
   }
 
-  if (!data) {
+  // ------------------------------------------------------------------
+  // Render: Error state
+  // ------------------------------------------------------------------
+  if (!info) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-zinc-950 text-white font-sans">
         <div className="text-center max-w-md p-6 bg-zinc-900 border border-zinc-800 rounded-2xl shadow-xl">
-          <h2 className="text-xl font-bold text-red-400 mb-2">Data Not Found</h2>
+          <h2 className="text-xl font-bold text-red-400 mb-2">
+            Backend Not Available (Yet)
+          </h2>
           <p className="text-zinc-400 mb-4 text-sm">
-            Could not load <code className="bg-zinc-950 px-1.5 py-0.5 rounded text-red-300">graph_data.json</code>. Make sure to run your Python script first to generate the map files in the Next.js public directory!
+            Could not connect to the FastAPI backend. It might still be downloading the initial city map, or it isn't running.
           </p>
-          <code className="block bg-zinc-950 p-3 rounded text-left text-xs font-mono text-zinc-300 overflow-x-auto select-all">
-            uv run main.py
-          </code>
+          <p className="text-zinc-500 mb-6 text-xs">
+            Check your terminal. Once you see <strong>"Application startup complete"</strong>, refresh this page.
+          </p>
+          <button 
+            onClick={() => window.location.reload()}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-semibold transition-colors"
+          >
+            Refresh Page
+          </button>
         </div>
       </div>
     );
   }
 
-  const filteredNodes = data.nodes.filter((node) => {
-    const matchesSearch =
-      node.id.toString().includes(search) ||
-      node.lat.toFixed(5).includes(search) ||
-      node.lon.toFixed(5).includes(search);
-    const matchesStreets = minStreets === "" || node.street_count >= minStreets;
-    return matchesSearch && matchesStreets;
-  });
-
+  // ------------------------------------------------------------------
+  // Render: Main UI
+  // ------------------------------------------------------------------
   return (
     <div className="flex h-screen w-screen bg-zinc-950 text-zinc-100 font-sans overflow-hidden">
-      {/* Sidebar: Controls & Pathfinding */}
+      {/* Sidebar */}
       <aside className="w-96 border-r border-zinc-800 bg-zinc-900/60 backdrop-blur-md flex flex-col h-full shrink-0">
         {/* Header */}
         <div className="p-6 border-b border-zinc-800 flex flex-col gap-1.5">
           <div className="flex items-center gap-2">
-            <span className="h-3 w-3 rounded-full bg-indigo-500 animate-pulse"></span>
+            <span className="h-3 w-3 rounded-full bg-indigo-500 animate-pulse" />
             <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-              Interactive Path Routing
+              GMap Router
             </span>
           </div>
-          <h1 className="text-2xl font-bold tracking-tight text-white">{data.location}</h1>
-          <p className="text-xs text-zinc-500 font-mono">Network Type: {data.network_type}</p>
+          <h1 className="text-2xl font-bold tracking-tight text-white">
+            {info.location}
+          </h1>
+          <p className="text-xs text-zinc-500 font-mono">
+            {info.num_nodes.toLocaleString()} nodes ·{" "}
+            {info.num_edges.toLocaleString()} edges · {info.network_type}
+          </p>
         </div>
 
-        {/* Path Planner Section */}
+        {/* Location Search */}
+        <form
+          onSubmit={handleLoadLocation}
+          className="p-4 border-b border-zinc-800 flex flex-col gap-2"
+        >
+          <label className="text-[10px] uppercase font-bold text-zinc-500">
+            Search Location
+          </label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              placeholder="e.g. Rome, Italy"
+              value={locationInput}
+              onChange={(e) => setLocationInput(e.target.value)}
+              disabled={locationLoading}
+              className="flex-1 text-xs bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500 placeholder-zinc-600 text-white disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={locationLoading || !locationInput.trim()}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              {locationLoading ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                  Loading…
+                </span>
+              ) : (
+                "Go"
+              )}
+            </button>
+          </div>
+          {locationError && (
+            <p className="text-[10px] text-red-400 animate-fade-in">
+              {locationError}
+            </p>
+          )}
+        </form>
+
+        {/* Route Planner */}
         <div className="p-6 border-b border-zinc-800 flex flex-col gap-4">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
             Route Planner
           </h3>
-          
+
           <div className="flex flex-col gap-3">
-            {/* Source Input */}
+            {/* Source */}
             <div className="flex flex-col gap-1">
-              <span className="text-[10px] uppercase font-bold text-zinc-500">Source Point (Green)</span>
+              <span className="text-[10px] uppercase font-bold text-zinc-500">
+                Source Point (Green)
+              </span>
               <div className="flex gap-2">
-                <div className="flex-1 bg-zinc-950 border border-zinc-850 px-3 py-2 rounded-lg text-xs font-mono flex items-center justify-between text-zinc-300">
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 px-3 py-2 rounded-lg text-xs font-mono flex items-center justify-between text-zinc-300">
                   {sourceNode ? (
-                    <span>ID: {sourceNode.id}</span>
+                    <span>
+                      ID: {sourceNode.id} ({sourceNode.lat.toFixed(4)},{" "}
+                      {sourceNode.lon.toFixed(4)})
+                    </span>
                   ) : (
-                    <span className="text-zinc-600 italic">Click map to set...</span>
+                    <span className="text-zinc-600 italic">
+                      Click map to set...
+                    </span>
                   )}
                 </div>
                 <button
@@ -395,15 +494,22 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Destination Input */}
+            {/* Destination */}
             <div className="flex flex-col gap-1">
-              <span className="text-[10px] uppercase font-bold text-zinc-500">Destination Point (Red)</span>
+              <span className="text-[10px] uppercase font-bold text-zinc-500">
+                Destination Point (Red)
+              </span>
               <div className="flex gap-2">
-                <div className="flex-1 bg-zinc-950 border border-zinc-850 px-3 py-2 rounded-lg text-xs font-mono flex items-center justify-between text-zinc-300">
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 px-3 py-2 rounded-lg text-xs font-mono flex items-center justify-between text-zinc-300">
                   {destNode ? (
-                    <span>ID: {destNode.id}</span>
+                    <span>
+                      ID: {destNode.id} ({destNode.lat.toFixed(4)},{" "}
+                      {destNode.lon.toFixed(4)})
+                    </span>
                   ) : (
-                    <span className="text-zinc-600 italic">Click map to set...</span>
+                    <span className="text-zinc-600 italic">
+                      Click map to set...
+                    </span>
                   )}
                 </div>
                 <button
@@ -419,10 +525,20 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Path Results */}
-            {calculatedRoute && (
+            {/* Route loading indicator */}
+            {routeLoading && (
+              <div className="flex items-center gap-2 text-xs text-zinc-400 animate-fade-in">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
+                Calculating shortest path...
+              </div>
+            )}
+
+            {/* Route result */}
+            {calculatedRoute && calculatedRoute.found && (
               <div className="bg-red-950/20 border border-red-500/25 p-4 rounded-xl flex flex-col gap-2 animate-fade-in">
-                <span className="text-[10px] uppercase font-bold text-red-400">Route Found</span>
+                <span className="text-[10px] uppercase font-bold text-red-400">
+                  Route Found
+                </span>
                 <div className="flex justify-between items-end">
                   <div>
                     <span className="text-2xl font-bold text-white">
@@ -432,19 +548,28 @@ export default function Home() {
                   </div>
                   <div className="text-right">
                     <span className="text-sm font-semibold text-zinc-300">
-                      {calculatedRoute.path.length}
+                      {calculatedRoute.junctions}
                     </span>
-                    <span className="text-[10px] text-zinc-500 block">Junctions</span>
+                    <span className="text-[10px] text-zinc-500 block">
+                      Junctions
+                    </span>
                   </div>
                 </div>
               </div>
             )}
 
-            {/* Reset Button */}
+            {/* No route found */}
+            {calculatedRoute && !calculatedRoute.found && (
+              <div className="bg-amber-950/20 border border-amber-500/25 p-3 rounded-xl text-xs text-amber-300 animate-fade-in">
+                No route found between these points.
+              </div>
+            )}
+
+            {/* Reset */}
             {(sourceNode || destNode) && (
               <button
                 onClick={handleReset}
-                className="w-full bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-750 text-xs font-semibold py-2 rounded-lg transition-colors text-zinc-400 hover:text-white"
+                className="w-full bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700 text-xs font-semibold py-2 rounded-lg transition-colors text-zinc-400 hover:text-white"
               >
                 Clear Route Selection
               </button>
@@ -469,7 +594,9 @@ export default function Home() {
               <select
                 value={minStreets}
                 onChange={(e) =>
-                  setMinStreets(e.target.value === "" ? "" : Number(e.target.value))
+                  setMinStreets(
+                    e.target.value === "" ? "" : Number(e.target.value)
+                  )
                 }
                 className="text-xs bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 focus:outline-none focus:border-indigo-500 text-zinc-400"
               >
@@ -480,73 +607,120 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Node List */}
+          {/* Node list */}
           <div className="flex-1 overflow-y-auto px-4 py-2 divide-y divide-zinc-800/40">
-            {filteredNodes.slice(0, 50).map((node) => (
-              <div
-                key={node.id}
-                className="py-2.5 flex items-center justify-between text-xs hover:bg-zinc-800/30 px-2 rounded-lg transition-colors"
-              >
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-mono text-zinc-300 font-semibold">{node.id}</span>
-                  <span className="text-zinc-500 font-mono text-[10px]">
-                    {node.lat.toFixed(5)}, {node.lon.toFixed(5)}
-                  </span>
+            {nodesLoading && nodes.length === 0 ? (
+              // Skeleton loaders
+              Array.from({ length: 6 }).map((_, i) => (
+                <div key={i} className="py-3 flex items-center justify-between">
+                  <div className="flex flex-col gap-1">
+                    <div className="h-3 w-20 bg-zinc-800 rounded animate-shimmer" />
+                    <div className="h-2 w-32 bg-zinc-800/60 rounded animate-shimmer" />
+                  </div>
+                  <div className="flex gap-1">
+                    <div className="h-5 w-12 bg-zinc-800 rounded animate-shimmer" />
+                    <div className="h-5 w-10 bg-zinc-800 rounded animate-shimmer" />
+                    <div className="h-5 w-10 bg-zinc-800 rounded animate-shimmer" />
+                  </div>
                 </div>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => handleLocateNode(node)}
-                    className="px-1.5 py-0.5 rounded text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500 hover:text-white font-semibold transition-colors"
+              ))
+            ) : (
+              <>
+                {nodes.map((node) => (
+                  <div
+                    key={node.id}
+                    className="py-2.5 flex items-center justify-between text-xs hover:bg-zinc-800/30 px-2 rounded-lg transition-colors"
                   >
-                    Locate
-                  </button>
-                  <button
-                    onClick={() => setSourceNode(node)}
-                    className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500 hover:text-black font-semibold transition-colors"
-                  >
-                    Start
-                  </button>
-                  <button
-                    onClick={() => setDestNode(node)}
-                    className="px-1.5 py-0.5 rounded text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500 hover:text-white font-semibold transition-colors"
-                  >
-                    End
-                  </button>
-                </div>
-              </div>
-            ))}
-            {filteredNodes.length === 0 && (
-              <div className="text-center text-zinc-600 text-sm py-8">No matching nodes found.</div>
-            )}
-            {filteredNodes.length > 50 && (
-              <div className="text-center text-zinc-500 text-[10px] py-2">
-                Showing top 50 of {filteredNodes.length} nodes
-              </div>
+                    <div className="flex flex-col gap-0.5">
+                      <span className="font-mono text-zinc-300 font-semibold">
+                        {node.id}
+                      </span>
+                      <span className="text-zinc-500 font-mono text-[10px]">
+                        {node.lat.toFixed(5)}, {node.lon.toFixed(5)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleLocateNode(node)}
+                        className="px-1.5 py-0.5 rounded text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500 hover:text-white font-semibold transition-colors"
+                      >
+                        Locate
+                      </button>
+                      <button
+                        onClick={() => {
+                          setSourceNode(node);
+                          setRoutingMode("destination");
+                        }}
+                        className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500 hover:text-black font-semibold transition-colors"
+                      >
+                        Start
+                      </button>
+                      <button
+                        onClick={() => {
+                          setDestNode(node);
+                          setRoutingMode(null);
+                        }}
+                        className="px-1.5 py-0.5 rounded text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500 hover:text-white font-semibold transition-colors"
+                      >
+                        End
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {nodes.length === 0 && !nodesLoading && (
+                  <div className="text-center text-zinc-600 text-sm py-8">
+                    No matching nodes found.
+                  </div>
+                )}
+                {totalNodes > 50 && (
+                  <div className="text-center text-zinc-500 text-[10px] py-2">
+                    Showing top 50 of {totalNodes.toLocaleString()} nodes
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
       </aside>
 
-      {/* Main Map Viewport */}
+      {/* Main Map */}
       <main className="flex-1 h-full relative bg-zinc-950">
+        {locationLoading && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm animate-slide-down">
+            <div className="flex flex-col items-center gap-3">
+              <div className="h-8 w-8 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent" />
+              <p className="text-zinc-400 text-sm">
+                Loading road network...
+              </p>
+              <p className="text-zinc-600 text-xs">
+                This may take 10-30 seconds for large cities
+              </p>
+            </div>
+          </div>
+        )}
         <iframe
+          key={mapKey}
           id="map-iframe"
-          src="/map.html"
+          src="/api/map"
           className="w-full h-full border-none"
           title="Interactive Map"
         />
-        {/* Floating coordinate/map overlay control */}
+        {/* Floating info bar */}
         <div className="absolute bottom-4 right-4 bg-zinc-900/90 border border-zinc-800 px-4 py-2.5 rounded-xl shadow-2xl backdrop-blur-md flex items-center gap-4 text-xs font-mono">
           <div>
             <span className="text-zinc-500">Center:</span>{" "}
             <span className="text-zinc-300">
-              {data.center.lat.toFixed(5)}, {data.center.lon.toFixed(5)}
+              {info.center.lat.toFixed(5)}, {info.center.lon.toFixed(5)}
             </span>
           </div>
-          <div className="h-4 w-px bg-zinc-800"></div>
+          <div className="h-4 w-px bg-zinc-800" />
           <div>
-            <span className="text-zinc-500">Zoom Performance:</span>{" "}
-            <span className="text-emerald-400">Canvas Optimized (Fast)</span>
+            <span className="text-zinc-500">Mode:</span>{" "}
+            <span className="text-emerald-400">
+              {routingMode
+                ? `Click to set ${routingMode}`
+                : "Route ready"}
+            </span>
           </div>
         </div>
       </main>

@@ -1,264 +1,399 @@
+"""
+FastAPI backend for the GMap Router application.
+
+Serves an OSMnx road network graph, provides shortest-path routing via
+Dijkstra (NetworkX), nearest-node snapping, and dynamic city loading.
+"""
+
 import os
 import json
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import networkx as nx
 import osmnx as ox
 import folium
-import branca
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+from scipy.spatial import KDTree
 
-def main():
-    print("Fetching drivable road network for Verona, Veneto, Italy...")
-    # Fetch graph from place name (limited to drivable streets to keep it lightweight)
-    G = ox.graph_from_place("Verona, Veneto, Italy", network_type="drive")
-    
-    # Convert graph to GeoDataFrames
-    gdf_nodes, gdf_edges = ox.graph_to_gdfs(G)
-    
-    # Find center coordinates of the graph for map positioning
-    centroid = gdf_nodes.union_all().centroid
-    center_lat, center_lon = centroid.y, centroid.x
-    
-    # Create base map with prefer_canvas=True for smooth panning and zooming performance
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gmaps-backend")
+
+# ---------------------------------------------------------------------------
+# In-memory graph store
+# ---------------------------------------------------------------------------
+_state: dict = {
+    "G": None,
+    "gdf_nodes": None,
+    "gdf_edges": None,
+    "location": None,
+    "network_type": "drive",
+    "center": {"lat": 0.0, "lon": 0.0},
+    "node_lookup": {},   # id -> {id, lat, lon, street_count}
+    "kdtree": None,      # scipy KDTree for fast nearest-node
+    "kdtree_ids": [],    # ordered node ids matching KDTree rows
+    "map_html": "",      # pre-rendered Folium HTML string
+}
+
+
+# ---------------------------------------------------------------------------
+# Graph loading helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_map_html(gdf_edges, center_lat: float, center_lon: float) -> str:
+    """Generate the Folium/Leaflet map HTML string."""
     m = folium.Map(
         location=[center_lat, center_lon],
         zoom_start=13,
         tiles="cartodbpositron",
-        prefer_canvas=True
+        prefer_canvas=True,
     )
-    
-    # Keep only the essential columns to drastically reduce the output HTML file size
-    columns_to_keep = ['geometry']
-    if 'name' in gdf_edges.columns:
-        columns_to_keep.append('name')
-    if 'highway' in gdf_edges.columns:
-        columns_to_keep.append('highway')
-        
+
+    # Slim down edges for rendering
+    columns_to_keep = ["geometry"]
+    if "name" in gdf_edges.columns:
+        columns_to_keep.append("name")
+    if "highway" in gdf_edges.columns:
+        columns_to_keep.append("highway")
+
     plot_edges = gdf_edges[columns_to_keep].copy()
-    
-    # Clean up the edges data to make it GeoJSON serializable (converting list values to strings)
+
     for col in plot_edges.columns:
-        if col != 'geometry':
+        if col != "geometry":
             plot_edges[col] = plot_edges[col].apply(
                 lambda x: ", ".join(map(str, x)) if isinstance(x, list) else x
             )
             plot_edges[col] = plot_edges[col].fillna("")
-            
-    # Add road network to the map
-    tooltip_fields = []
-    if 'name' in plot_edges.columns:
-        tooltip_fields.append('name')
-    if 'highway' in plot_edges.columns:
-        tooltip_fields.append('highway')
-        
-    print("Generating interactive map...")
+
+    tooltip_fields = [c for c in ["name", "highway"] if c in plot_edges.columns]
+
     folium.GeoJson(
         plot_edges,
-        style_function=lambda x: {
-            'color': '#3388ff',
-            'weight': 2,
-            'opacity': 0.7
-        },
-        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None
+        style_function=lambda x: {"color": "#3388ff", "weight": 2, "opacity": 0.7},
+        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None,
     ).add_to(m)
-    
-    # Inject JavaScript for interactive source/destination marking and path drawing
-    js_code = """
+
+    # Inject click-forwarding JS
+    map_name = m.get_name()
+    js_code = f"""
     var routeLayer = null;
     var sourceMarker = null;
     var destinationMarker = null;
 
-    console.log("Map script loaded successfully!");
-    
-    // Function to send click event to parent
-    function sendClick(e) {
-        console.log("Map click event captured inside iframe:", e);
-        if (e && e.latlng) {
-            console.log("Sending MAP_CLICK to parent:", e.latlng);
-            window.parent.postMessage({
+    function sendClick(e) {{
+        if (e && e.latlng) {{
+            window.parent.postMessage({{
                 type: 'MAP_CLICK',
                 lat: e.latlng.lat,
                 lng: e.latlng.lng
-            }, '*');
-        }
-    }
+            }}, '*');
+        }}
+    }}
 
-    // Listen to clicks on the map
-    {{this.get_name()}}.on('click', sendClick);
+    {map_name}.on('click', sendClick);
+    {map_name}.eachLayer(function(layer) {{
+        if (layer.on) layer.on('click', sendClick);
+    }});
 
-    // Listen to clicks on any other layers (like the GeoJSON roads)
-    {{this.get_name()}}.eachLayer(function(layer) {
-        if (layer.on) {
-            layer.on('click', sendClick);
-        }
-    });
-
-    // Listen to messages from the parent window
-    window.addEventListener('message', function(event) {
+    window.addEventListener('message', function(event) {{
         var data = event.data;
         if (!data || !data.type) return;
-        
-        if (data.type === 'UPDATE_ROUTE') {
-            // Clear previous layers
-            if (routeLayer) {{this.get_name()}}.removeLayer(routeLayer);
-            if (sourceMarker) {{this.get_name()}}.removeLayer(sourceMarker);
-            if (destinationMarker) {{this.get_name()}}.removeLayer(destinationMarker);
-            
-            // Add source marker
-            if (data.source) {
-                sourceMarker = L.marker([data.source.lat, data.source.lng], {
-                    icon: L.divIcon({
+
+        if (data.type === 'UPDATE_ROUTE') {{
+            if (routeLayer) {map_name}.removeLayer(routeLayer);
+            if (sourceMarker) {map_name}.removeLayer(sourceMarker);
+            if (destinationMarker) {map_name}.removeLayer(destinationMarker);
+
+            if (data.source) {{
+                sourceMarker = L.marker([data.source.lat, data.source.lng], {{
+                    icon: L.divIcon({{
                         className: 'custom-div-icon-source',
                         html: "<div style='background-color:#10B981;width:14px;height:14px;border-radius:50%;border:3px solid white;box-shadow:0 0 10px rgba(0,0,0,0.5);'></div>",
-                        iconSize: [14, 14],
-                        iconAnchor: [7, 7]
-                    })
-                }).addTo({{this.get_name()}}).bindPopup("Source: " + data.source.id);
-            }
-            
-            // Add destination marker
-            if (data.destination) {
-                destinationMarker = L.marker([data.destination.lat, data.destination.lng], {
-                    icon: L.divIcon({
+                        iconSize: [14, 14], iconAnchor: [7, 7]
+                    }})
+                }}).addTo({map_name}).bindPopup("Source: " + data.source.id);
+            }}
+
+            if (data.destination) {{
+                destinationMarker = L.marker([data.destination.lat, data.destination.lng], {{
+                    icon: L.divIcon({{
                         className: 'custom-div-icon-dest',
                         html: "<div style='background-color:#EF4444;width:14px;height:14px;border-radius:50%;border:3px solid white;box-shadow:0 0 10px rgba(0,0,0,0.5);'></div>",
-                        iconSize: [14, 14],
-                        iconAnchor: [7, 7]
-                    })
-                }).addTo({{this.get_name()}}).bindPopup("Destination: " + data.destination.id);
-            }
-            
-            // Add route line
-            if (data.routeCoords && data.routeCoords.length > 0) {
-                routeLayer = L.polyline(data.routeCoords, {
-                    color: '#EF4444',
-                    weight: 8,
-                    opacity: 0.9
-                }).addTo({{this.get_name()}});
-                
-                // Zoom map to fit the route bounds
-                {{this.get_name()}}.fitBounds(routeLayer.getBounds(), {padding: [50, 50]});
-            }
-        } else if (data.type === 'CLEAR_ROUTE') {
-            if (routeLayer) {{this.get_name()}}.removeLayer(routeLayer);
-            if (sourceMarker) {{this.get_name()}}.removeLayer(sourceMarker);
-            if (destinationMarker) {{this.get_name()}}.removeLayer(destinationMarker);
-        } else if (data.type === 'LOCATE_NODE') {
-            console.log("LOCATING NODE", data);
-            {{this.get_name()}}.setView([data.lat, data.lng], 17);
-            if (window.locateMarker) {{this.get_name()}}.removeLayer(window.locateMarker);
-            window.locateMarker = L.circleMarker([data.lat, data.lng], {
-                color: '#3B82F6',
-                fillColor: '#3B82F6',
-                fillOpacity: 0.8,
-                radius: 8
-            }).addTo({{this.get_name()}});
-        }
-    });
+                        iconSize: [14, 14], iconAnchor: [7, 7]
+                    }})
+                }}).addTo({map_name}).bindPopup("Destination: " + data.destination.id);
+            }}
+
+            if (data.routeCoords && data.routeCoords.length > 0) {{
+                routeLayer = L.polyline(data.routeCoords, {{
+                    color: '#EF4444', weight: 8, opacity: 0.9
+                }}).addTo({map_name});
+                {map_name}.fitBounds(routeLayer.getBounds(), {{padding: [50, 50]}});
+            }}
+        }} else if (data.type === 'CLEAR_ROUTE') {{
+            if (routeLayer) {map_name}.removeLayer(routeLayer);
+            if (sourceMarker) {map_name}.removeLayer(sourceMarker);
+            if (destinationMarker) {map_name}.removeLayer(destinationMarker);
+        }} else if (data.type === 'LOCATE_NODE') {{
+            {map_name}.setView([data.lat, data.lng], 17);
+            if (window.locateMarker) {map_name}.removeLayer(window.locateMarker);
+            window.locateMarker = L.circleMarker([data.lat, data.lng], {{
+                color: '#3B82F6', fillColor: '#3B82F6', fillOpacity: 0.8, radius: 8
+            }}).addTo({map_name});
+        }}
+    }});
     """
-    map_name = m.get_name()
-    final_js = js_code.replace('{{this.get_name()}}', map_name)
-    
-    # Ensure public folder exists
-    public_dir = os.path.join("app", "public")
-    os.makedirs(public_dir, exist_ok=True)
-    
-    print("Saving interactive map to 'app/public/map.html'...")
-    map_path = os.path.join(public_dir, "map.html")
-    m.save(map_path)
-    
-    # Post-process: inject our custom script at the very END of the HTML,
-    # AFTER the Leaflet map object has been created by Folium's own scripts.
-    with open(map_path, "r", encoding="utf-8") as f:
-        html_content = f.read()
-    
-    inject_script = f"\n<script>\n{final_js}\n</script>\n"
-    html_content = html_content.replace("</html>", inject_script + "</html>")
-    
-    with open(map_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    
-    # Extract metadata and stats
-    print("Extracting and saving node metadata to 'app/public/graph_data.json'...")
-    num_nodes = len(G.nodes)
-    num_edges = len(G.edges)
-    
-    # Calculate average street count
-    street_counts_series = gdf_nodes['street_count']
-    avg_street_count = float(street_counts_series.mean())
-    street_counts_dist = {int(k): int(v) for k, v in street_counts_series.value_counts().items()}
-    
-    # List of node objects
-    nodes_list = []
+
+    html = m.get_root().render()
+    inject_script = f"\n<script>\n{js_code}\n</script>\n"
+    html = html.replace("</html>", inject_script + "</html>")
+    return html
+
+
+def load_location(location: str, network_type: str = "drive") -> None:
+    """Fetch the road network for *location* and populate _state."""
+    logger.info("Loading road network for '%s' (type=%s)...", location, network_type)
+
+    G = ox.graph_from_place(location, network_type=network_type)
+    gdf_nodes, gdf_edges = ox.graph_to_gdfs(G)
+
+    centroid = gdf_nodes.union_all().centroid
+    center_lat, center_lon = centroid.y, centroid.x
+
+    # Build node lookup dict & KDTree arrays
+    node_lookup = {}
+    coords_for_tree = []
+    kdtree_ids = []
     for node_id, data in G.nodes(data=True):
-        nodes_list.append({
+        lat = float(data.get("y"))
+        lon = float(data.get("x"))
+        node_lookup[int(node_id)] = {
             "id": int(node_id),
-            "lat": float(data.get('y')),
-            "lon": float(data.get('x')),
-            "street_count": int(data.get('street_count', 0))
-        })
-        
-    # Sort nodes by street_count descending
-    nodes_list.sort(key=lambda x: x['street_count'], reverse=True)
-    
-    # Build adjacency list for Dijkstra and route rendering
-    adjacency = {}
-    for u, v, k, data in G.edges(keys=True, data=True):
-        u_str = str(u)
-        v_str = str(v)
-        
-        # Get geometry coordinates
-        geom = data.get('geometry')
+            "lat": lat,
+            "lon": lon,
+            "street_count": int(data.get("street_count", 0)),
+        }
+        coords_for_tree.append((lat, lon))
+        kdtree_ids.append(int(node_id))
+
+    kdtree = KDTree(coords_for_tree)
+
+    # Build map HTML
+    map_html = _build_map_html(gdf_edges, center_lat, center_lon)
+
+    # Write state
+    _state.update(
+        {
+            "G": G,
+            "gdf_nodes": gdf_nodes,
+            "gdf_edges": gdf_edges,
+            "location": location,
+            "network_type": network_type,
+            "center": {"lat": center_lat, "lon": center_lon},
+            "node_lookup": node_lookup,
+            "kdtree": kdtree,
+            "kdtree_ids": kdtree_ids,
+            "map_html": map_html,
+        }
+    )
+    logger.info(
+        "Loaded %d nodes, %d edges for '%s'.",
+        len(G.nodes),
+        len(G.edges),
+        location,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load default location on startup."""
+    default_location = os.environ.get("GMAPS_DEFAULT_LOCATION", "Verona, Veneto, Italy")
+    default_network = os.environ.get("GMAPS_NETWORK_TYPE", "drive")
+    load_location(default_location, default_network)
+    yield
+
+
+app = FastAPI(
+    title="GMap Router API",
+    description="OSMnx-powered road network routing backend",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class LatLng(BaseModel):
+    lat: float
+    lng: float
+
+
+class RouteRequest(BaseModel):
+    source_id: int
+    destination_id: int
+
+
+class LoadLocationRequest(BaseModel):
+    location: str
+    network_type: str = "drive"
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/graph-info")
+def graph_info():
+    """Return lightweight graph metadata."""
+    G = _state["G"]
+    if G is None:
+        raise HTTPException(status_code=503, detail="No graph loaded yet")
+    return {
+        "location": _state["location"],
+        "loading_location": _state.get("loading_location"),
+        "network_type": _state["network_type"],
+        "num_nodes": len(G.nodes),
+        "num_edges": len(G.edges),
+        "center": _state["center"],
+    }
+
+
+@app.get("/api/nodes")
+def get_nodes(
+    search: str = Query("", description="Search by node ID or coordinates"),
+    min_streets: Optional[int] = Query(None, description="Minimum street_count filter"),
+    limit: int = Query(50, ge=1, le=200, description="Max results"),
+):
+    """Return filtered, paginated node list (sorted by street_count desc)."""
+    if not _state["node_lookup"]:
+        raise HTTPException(status_code=503, detail="No graph loaded yet")
+
+    nodes = sorted(
+        _state["node_lookup"].values(),
+        key=lambda n: n["street_count"],
+        reverse=True,
+    )
+
+    # Apply filters
+    if min_streets is not None:
+        nodes = [n for n in nodes if n["street_count"] >= min_streets]
+
+    if search:
+        search_lower = search.lower()
+        nodes = [
+            n
+            for n in nodes
+            if search_lower in str(n["id"])
+            or search_lower in f"{n['lat']:.5f}"
+            or search_lower in f"{n['lon']:.5f}"
+        ]
+
+    total = len(nodes)
+    return {"total": total, "nodes": nodes[:limit]}
+
+
+@app.post("/api/nearest-node")
+def nearest_node(payload: LatLng):
+    """Find the nearest graph node to the given coordinates."""
+    if _state["kdtree"] is None:
+        raise HTTPException(status_code=503, detail="No graph loaded yet")
+
+    _, idx = _state["kdtree"].query([payload.lat, payload.lng])
+    node_id = _state["kdtree_ids"][idx]
+    return _state["node_lookup"][node_id]
+
+
+@app.post("/api/route")
+def calculate_route(payload: RouteRequest):
+    """Compute shortest path between two nodes using Dijkstra."""
+    G = _state["G"]
+    if G is None:
+        raise HTTPException(status_code=503, detail="No graph loaded yet")
+
+    src = payload.source_id
+    dst = payload.destination_id
+
+    if src not in G.nodes:
+        raise HTTPException(status_code=404, detail=f"Source node {src} not found in graph")
+    if dst not in G.nodes:
+        raise HTTPException(status_code=404, detail=f"Destination node {dst} not found in graph")
+
+    try:
+        path = nx.shortest_path(G, src, dst, weight="length")
+        distance = nx.shortest_path_length(G, src, dst, weight="length")
+    except nx.NetworkXNoPath:
+        return {"found": False, "path": [], "coords": [], "distance": 0, "junctions": 0}
+
+    # Build polyline coordinates from edge geometries
+    coords: list[list[float]] = []
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        # Get the best (shortest) edge between u and v
+        edge_data = min(G[u][v].values(), key=lambda d: d.get("length", 0))
+        geom = edge_data.get("geometry")
         if geom:
-            # coords are (lon, lat) in Shapely, we need (lat, lon) for Folium
-            coords = [[lat, lon] for lon, lat in geom.coords]
+            segment = [[lat, lon] for lon, lat in geom.coords]
         else:
             u_data = G.nodes[u]
             v_data = G.nodes[v]
-            coords = [[u_data['y'], u_data['x']], [v_data['y'], v_data['x']]]
-            
-        weight = data.get('length', 0)
-        
-        if u_str not in adjacency:
-            adjacency[u_str] = []
-            
-        # Check if an edge between u and v already exists
-        existing_edge_idx = -1
-        for idx, edge in enumerate(adjacency[u_str]):
-            if edge["target"] == v_str:
-                existing_edge_idx = idx
-                break
-                
-        edge_entry = {
-            "target": v_str,
-            "weight": weight,
-            "coords": coords
-        }
-        
-        if existing_edge_idx == -1:
-            adjacency[u_str].append(edge_entry)
-        else:
-            if weight < adjacency[u_str][existing_edge_idx]["weight"]:
-                adjacency[u_str][existing_edge_idx] = edge_entry
-    
-    graph_data = {
-        "location": "Verona, Veneto, Italy",
-        "network_type": "drive",
-        "num_nodes": num_nodes,
-        "num_edges": num_edges,
-        "avg_street_count": round(avg_street_count, 2),
-        "street_counts": street_counts_dist,
-        "center": {"lat": center_lat, "lon": center_lon},
-        "nodes": nodes_list,
-        "adjacency": adjacency
+            segment = [[u_data["y"], u_data["x"]], [v_data["y"], v_data["x"]]]
+        coords.extend(segment)
+
+    return {
+        "found": True,
+        "path": [int(n) for n in path],
+        "coords": coords,
+        "distance": round(distance, 2),
+        "junctions": len(path),
     }
-    
-    with open(os.path.join(public_dir, "graph_data.json"), "w", encoding="utf-8") as f:
-        json.dump(graph_data, f, indent=2)
-        
-    print("Done! Files successfully created in Next.js public directory.")
 
 
-if __name__ == "__main__":
-    main()
+from fastapi import BackgroundTasks
+
+def _do_load_location(location: str, network_type: str):
+    try:
+        load_location(location, network_type)
+    except Exception as e:
+        logger.exception("Failed to load location '%s'", location)
+    finally:
+        _state["loading_location"] = None
+
+@app.post("/api/load-location")
+def api_load_location(payload: LoadLocationRequest, background_tasks: BackgroundTasks):
+    """Switch to a different city / location in the background."""
+    _state["loading_location"] = payload.location
+    background_tasks.add_task(_do_load_location, payload.location, payload.network_type)
+    return {"status": "loading", "location": payload.location}
 
 
 
 
+@app.get("/api/map", response_class=HTMLResponse)
+def serve_map():
+    """Serve the pre-rendered Folium map HTML."""
+    if not _state["map_html"]:
+        raise HTTPException(status_code=503, detail="Map not generated yet")
+    return _state["map_html"]

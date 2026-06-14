@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - GMAPS_DEFAULT_LOCATION=Verona, Veneto, Italy
+    volumes:
+      - ./cache:/app/cache
+
+  frontend:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        API_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      # Use the docker internal network to connect frontend to backend for server-side proxy
+      - API_URL=http://backend:8000
