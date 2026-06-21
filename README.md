@@ -1,89 +1,136 @@
-# 🗺️ GMap Router
+# GMap Router
 
-GMap Router is an interactive shortest-path routing application that allows you to load road networks for different cities worldwide (powered by OSMnx/OpenStreetMap), visualize them, and instantly calculate shortest paths using Dijkstra's algorithm.
+GMap Router is an interactive shortest-path routing application that lets you load road networks for any city worldwide (powered by OSMnx/OpenStreetMap), visualize them, and watch Dijkstra's algorithm explore the graph in real time before revealing the shortest path.
 
-The application uses a modern, high-performance architecture:
-- **Backend:** FastAPI (Python) fetches map data, builds graph representations, exposes lightweight APIs, and runs large network downloads in the background so connections never drop.
-- **Frontend:** Next.js (React/TypeScript) provides a buttery smooth user interface, proxies API requests to the backend, and handles interactive Leaflet map integration without locking up your browser.
+**Architecture:**
+- **Backend:** FastAPI (Python) — fetches OSM road data, builds the graph, runs a custom Dijkstra implementation, and exposes a lightweight REST API. City downloads happen in the background so the server never drops.
+- **Frontend:** Next.js 16 (React/TypeScript) — dark-themed UI with a sidebar for routing controls and an embedded Leaflet map served as an HTML iframe.
 
 ---
 
-## 🚀 How to Run Locally (Manual Setup)
+## Features
 
-If you prefer to run the raw processes on your own machine without containerization, follow these steps.
+- Click anywhere on the map to set source and destination nodes
+- Watch Dijkstra's algorithm **explore nodes in real time** (amber dots spreading across the road network) before the shortest path is highlighted in red
+- Switch cities on the fly — type any place name and the backend downloads the new graph asynchronously while the UI stays responsive
+- Node explorer with search and street-count filtering
+
+---
+
+## Run Locally
 
 ### Prerequisites
-- Python 3.10+
+
+- Python **3.11+**
 - Node.js 20+
-- `uv` (The fast Python package installer)
+- [`uv`](https://github.com/astral-sh/uv) — fast Python package manager
 
 ### 1. Start the Backend
-Open your first terminal and run the following commands:
+
 ```bash
-# Navigate to the project root
+# From the project root
 cd gmaps
 
-# Install Python dependencies (creates a virtual environment and installs everything)
+# Install Python dependencies
 uv sync
 
-# Run the FastAPI server with auto-reload (skipping front-end & cache folders)
-uv run uvicorn main:app --reload --reload-include "*.py" --reload-exclude ".venv" --reload-exclude "app" --reload-exclude "cache" --reload-exclude ".git" --port 8000
+# Start the FastAPI server
+uv run uvicorn main:app --port 8000
 ```
-> **Note:** On first startup, the backend downloads the road network for Verona. Wait until you see `Application startup complete.` in your terminal (about 15–30 seconds) before proceeding.
+
+> On first startup the backend downloads the Verona road network (~15–30 seconds). Wait for `Application startup complete.` before opening the app.
+
+If `uv sync` fails due to a Python version conflict, run the server directly through the virtual environment instead:
+
+```bash
+# After uv has already created the .venv once
+.venv/bin/uvicorn main:app --port 8000
+```
 
 ### 2. Start the Frontend
-Open a second terminal and run:
+
 ```bash
-# Navigate to the Next.js app directory
+# In a second terminal
 cd gmaps/app
 
-# Install frontend dependencies
 npm install
-
-# Start the Next.js development server
 npm run dev
 ```
 
-### 3. Use the App
-- Open your browser to [http://localhost:3000](http://localhost:3000)
-- You can click on the map to set a Source and Destination.
-- To switch cities, use the search bar on the left (e.g. type `Rome, Italy` and click Go). The app handles massive city downloads asynchronously, so you'll see a smooth loading screen while the backend processes the map data!
+### 3. Open the App
+
+Go to [http://localhost:3000](http://localhost:3000)
+
+**Usage:**
+1. The map loads centred on Verona. Click any two points to set a **source** (green) and **destination** (red), or use the node list in the sidebar.
+2. Dijkstra's exploration animates as amber dots — watch the algorithm fan out from the source.
+3. Once exploration finishes, the shortest path draws as a red polyline and the distance appears in the sidebar.
+4. To switch cities, type a place name in the **Search Location** box (e.g. `Rome, Italy`) and click **Go**.
 
 ---
 
-## 🐳 How to Run with Docker
+## Run with Docker
 
-To easily run both the frontend and backend without managing Node or Python environments yourself, use Docker Compose.
+The easiest way to run both services together without managing Python or Node environments yourself.
 
 ### Prerequisites
-- Docker (Ensure Docker Desktop daemon is actually running!)
-- Docker Compose
 
-### 1. Start the Application
+- Docker Desktop (make sure the daemon is running)
 
-From the root `gmaps` directory, simply run:
+### Start
 
 ```bash
+# From the project root
 docker-compose up --build
 ```
 
-This single command will:
-1. Build the Python FastAPI backend image and install `uv` dependencies.
-2. Build the Next.js frontend image and statically analyze the API proxy config.
-3. Start both services on a shared internal Docker network.
-4. Mount the local `./cache` folder as a volume, so if you restart the server you don't have to redownload city maps from OpenStreetMap.
+This will:
+1. Build the Python backend image and install all dependencies via `uv`.
+2. Build the Next.js frontend image, configure the API proxy, and produce a production build.
+3. Start both services on a shared internal network.
+4. Mount `./cache` as a volume so downloaded city graphs survive container restarts.
 
-### 2. Use the App
+Then open [http://localhost:3000](http://localhost:3000).
 
-Once the terminal output settles and both services are listening, go to:
-- [http://localhost:3000](http://localhost:3000)
+### Stop
 
-### 3. Stopping and Cleaning Up
+```bash
+# Ctrl+C to stop, or:
+docker-compose down
+```
 
-To stop the application gracefully, press `Ctrl+C` in your terminal. 
+### Full clean rebuild
 
-If you ever need to completely wipe the Docker images and start totally fresh (for instance, after making a big configuration change), run:
 ```bash
 docker-compose down --rmi all -v
 docker-compose up --build --force-recreate
 ```
+
+---
+
+## Project Structure
+
+```
+gmaps/
+├── main.py              # FastAPI backend — graph loading, Dijkstra, REST API
+├── Dockerfile           # Backend container
+├── docker-compose.yml   # Orchestrates backend + frontend
+├── pyproject.toml       # Python dependencies
+├── cache/               # Downloaded OSMnx city graphs (auto-created)
+└── app/                 # Next.js frontend
+    ├── app/
+    │   ├── page.tsx     # Main UI — routing controls, node explorer, map iframe
+    │   └── layout.tsx
+    ├── next.config.ts   # Rewrites /api/* → FastAPI backend
+    └── Dockerfile       # Frontend container
+```
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `GMAPS_DEFAULT_LOCATION` | `Verona, Veneto, Italy` | City loaded on backend startup |
+| `GMAPS_NETWORK_TYPE` | `drive` | OSMnx network type (`drive`, `walk`, `bike`) |
+| `API_URL` | `http://localhost:8000` | Backend URL used by the Next.js proxy |

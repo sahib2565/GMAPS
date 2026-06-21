@@ -28,6 +28,7 @@ interface RouteResult {
   coords: [number, number][];
   distance: number;
   junctions: number;
+  visited_nodes?: { lat: number; lng: number }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,10 @@ export default function Home() {
   // Map iframe key (force remount on location change)
   const [mapKey, setMapKey] = useState(0);
 
+  // Exploration animation
+  const [isExploring, setIsExploring] = useState(false);
+  const explorationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // Debounce timer for node search
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -215,36 +220,70 @@ export default function Home() {
   }, [onMapClicked]);
 
   // ------------------------------------------------------------------
-  // Route calculation (server-side) + iframe sync
+  // Route calculation (server-side) + iframe sync + exploration animation
   // ------------------------------------------------------------------
   useEffect(() => {
+    // Cancel any in-progress exploration
+    if (explorationTimerRef.current) {
+      clearInterval(explorationTimerRef.current);
+      explorationTimerRef.current = null;
+    }
+    setIsExploring(false);
+
     const iframe = document.getElementById(
       "map-iframe"
     ) as HTMLIFrameElement | null;
     if (!iframe?.contentWindow) return;
+
+    iframe.contentWindow.postMessage({ type: "CLEAR_EXPLORATION" }, "*");
 
     if (sourceNode && destNode) {
       setRouteLoading(true);
       fetchRoute(sourceNode.id, destNode.id)
         .then((route) => {
           setCalculatedRoute(route.found ? route : null);
-          iframe.contentWindow!.postMessage(
-            {
-              type: "UPDATE_ROUTE",
-              source: {
-                lat: sourceNode.lat,
-                lng: sourceNode.lon,
-                id: sourceNode.id,
+
+          const sendFinalRoute = () => {
+            const el = document.getElementById(
+              "map-iframe"
+            ) as HTMLIFrameElement | null;
+            el?.contentWindow?.postMessage(
+              {
+                type: "UPDATE_ROUTE",
+                source: { lat: sourceNode.lat, lng: sourceNode.lon, id: sourceNode.id },
+                destination: { lat: destNode.lat, lng: destNode.lon, id: destNode.id },
+                routeCoords: route.found ? route.coords : [],
               },
-              destination: {
-                lat: destNode.lat,
-                lng: destNode.lon,
-                id: destNode.id,
-              },
-              routeCoords: route.found ? route.coords : [],
-            },
-            "*"
-          );
+              "*"
+            );
+          };
+
+          const visited = route.visited_nodes;
+          if (route.found && visited && visited.length > 0) {
+            const BATCH = 40;
+            const INTERVAL_MS = 30;
+            let idx = 0;
+            setIsExploring(true);
+            explorationTimerRef.current = setInterval(() => {
+              if (idx >= visited.length) {
+                clearInterval(explorationTimerRef.current!);
+                explorationTimerRef.current = null;
+                setIsExploring(false);
+                sendFinalRoute();
+                return;
+              }
+              const el = document.getElementById(
+                "map-iframe"
+              ) as HTMLIFrameElement | null;
+              el?.contentWindow?.postMessage(
+                { type: "EXPLORE_NODES_BATCH", nodes: visited.slice(idx, idx + BATCH) },
+                "*"
+              );
+              idx += BATCH;
+            }, INTERVAL_MS);
+          } else {
+            sendFinalRoute();
+          }
         })
         .catch((err) => {
           console.error("Route calculation failed:", err);
@@ -268,6 +307,14 @@ export default function Home() {
       );
       setCalculatedRoute(null);
     }
+
+    return () => {
+      if (explorationTimerRef.current) {
+        clearInterval(explorationTimerRef.current);
+        explorationTimerRef.current = null;
+      }
+      setIsExploring(false);
+    };
   }, [sourceNode, destNode]);
 
   // ------------------------------------------------------------------
@@ -289,6 +336,11 @@ export default function Home() {
   // Reset route
   // ------------------------------------------------------------------
   const handleReset = () => {
+    if (explorationTimerRef.current) {
+      clearInterval(explorationTimerRef.current);
+      explorationTimerRef.current = null;
+    }
+    setIsExploring(false);
     setSourceNode(null);
     setDestNode(null);
     setCalculatedRoute(null);
@@ -525,11 +577,17 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Route loading indicator */}
-            {routeLoading && (
+            {/* Route loading / exploration indicator */}
+            {(routeLoading || isExploring) && (
               <div className="flex items-center gap-2 text-xs text-zinc-400 animate-fade-in">
-                <span className="h-3 w-3 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
-                Calculating shortest path...
+                <span
+                  className={`h-3 w-3 animate-spin rounded-full border-2 border-t-transparent ${
+                    isExploring ? "border-amber-500" : "border-indigo-500"
+                  }`}
+                />
+                {isExploring
+                  ? "Visualizing node exploration..."
+                  : "Calculating shortest path..."}
               </div>
             )}
 

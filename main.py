@@ -7,6 +7,7 @@ Dijkstra (NetworkX), nearest-node snapping, and dynamic city loading.
 
 import os
 import json
+import heapq
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -41,6 +42,72 @@ _state: dict = {
     "kdtree_ids": [],    # ordered node ids matching KDTree rows
     "map_html": "",      # pre-rendered Folium HTML string
 }
+
+
+# ---------------------------------------------------------------------------
+# Dijkstra with exploration tracking
+# ---------------------------------------------------------------------------
+
+def _sample_explored(visited_order: list, max_count: int) -> list[dict]:
+    """Evenly sample visited_order and return [{lat, lng}, ...] dicts."""
+    node_lookup = _state["node_lookup"]
+    total = len(visited_order)
+    if total <= max_count:
+        sampled = visited_order
+    else:
+        step = total / max_count
+        sampled = [visited_order[int(i * step)] for i in range(max_count)]
+    return [
+        {"lat": node_lookup[n]["lat"], "lng": node_lookup[n]["lon"]}
+        for n in sampled
+        if n in node_lookup
+    ]
+
+
+def _dijkstra_with_exploration(
+    G, source: int, target: int, weight: str = "length", max_visited: int = 2000
+) -> tuple:
+    """Run Dijkstra and return (path | None, distance, visited_coords).
+
+    visited_coords is a sampled list of {lat, lng} dicts in exploration order.
+    """
+    if source == target:
+        return [source], 0.0, []
+
+    dist: dict = {source: 0.0}
+    prev: dict = {source: None}
+    heap: list = [(0.0, source)]
+    visited_order: list = []
+    settled: set = set()
+
+    while heap:
+        d, u = heapq.heappop(heap)
+        if u in settled:
+            continue
+        settled.add(u)
+        visited_order.append(u)
+        if u == target:
+            break
+        for v, edge_dict in G[u].items():
+            best = min(edge_dict.values(), key=lambda e: e.get(weight, 1.0))
+            w = float(best.get(weight, 1.0))
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(heap, (nd, v))
+
+    if target not in dist:
+        return None, float("inf"), _sample_explored(visited_order, max_visited)
+
+    path: list = []
+    cur = target
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+
+    return path, dist[target], _sample_explored(visited_order, max_visited)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +154,7 @@ def _build_map_html(gdf_edges, center_lat: float, center_lon: float) -> str:
     var routeLayer = null;
     var sourceMarker = null;
     var destinationMarker = null;
+    var explorationLayer = L.layerGroup().addTo({map_name});
 
     function sendClick(e) {{
         if (e && e.latlng) {{
@@ -108,6 +176,7 @@ def _build_map_html(gdf_edges, center_lat: float, center_lon: float) -> str:
         if (!data || !data.type) return;
 
         if (data.type === 'UPDATE_ROUTE') {{
+            explorationLayer.clearLayers();
             if (routeLayer) {map_name}.removeLayer(routeLayer);
             if (sourceMarker) {map_name}.removeLayer(sourceMarker);
             if (destinationMarker) {map_name}.removeLayer(destinationMarker);
@@ -139,6 +208,7 @@ def _build_map_html(gdf_edges, center_lat: float, center_lon: float) -> str:
                 {map_name}.fitBounds(routeLayer.getBounds(), {{padding: [50, 50]}});
             }}
         }} else if (data.type === 'CLEAR_ROUTE') {{
+            explorationLayer.clearLayers();
             if (routeLayer) {map_name}.removeLayer(routeLayer);
             if (sourceMarker) {map_name}.removeLayer(sourceMarker);
             if (destinationMarker) {map_name}.removeLayer(destinationMarker);
@@ -148,6 +218,19 @@ def _build_map_html(gdf_edges, center_lat: float, center_lon: float) -> str:
             window.locateMarker = L.circleMarker([data.lat, data.lng], {{
                 color: '#3B82F6', fillColor: '#3B82F6', fillOpacity: 0.8, radius: 8
             }}).addTo({map_name});
+        }} else if (data.type === 'EXPLORE_NODES_BATCH') {{
+            (data.nodes || []).forEach(function(n) {{
+                L.circleMarker([n.lat, n.lng], {{
+                    radius: 4,
+                    color: '#F59E0B',
+                    fillColor: '#FBBF24',
+                    fillOpacity: 0.55,
+                    weight: 0,
+                    interactive: false
+                }}).addTo(explorationLayer);
+            }});
+        }} else if (data.type === 'CLEAR_EXPLORATION') {{
+            explorationLayer.clearLayers();
         }}
     }});
     """
@@ -341,17 +424,15 @@ def calculate_route(payload: RouteRequest):
     if dst not in G.nodes:
         raise HTTPException(status_code=404, detail=f"Destination node {dst} not found in graph")
 
-    try:
-        path = nx.shortest_path(G, src, dst, weight="length")
-        distance = nx.shortest_path_length(G, src, dst, weight="length")
-    except nx.NetworkXNoPath:
-        return {"found": False, "path": [], "coords": [], "distance": 0, "junctions": 0}
+    path, distance, visited_nodes = _dijkstra_with_exploration(G, src, dst, weight="length")
+
+    if path is None:
+        return {"found": False, "path": [], "coords": [], "distance": 0, "junctions": 0, "visited_nodes": []}
 
     # Build polyline coordinates from edge geometries
     coords: list[list[float]] = []
     for i in range(len(path) - 1):
         u, v = path[i], path[i + 1]
-        # Get the best (shortest) edge between u and v
         edge_data = min(G[u][v].values(), key=lambda d: d.get("length", 0))
         geom = edge_data.get("geometry")
         if geom:
@@ -368,6 +449,7 @@ def calculate_route(payload: RouteRequest):
         "coords": coords,
         "distance": round(distance, 2),
         "junctions": len(path),
+        "visited_nodes": visited_nodes,
     }
 
 
